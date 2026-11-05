@@ -14,6 +14,7 @@ import os
 import copy
 import gc
 import threading
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9370,6 +9371,37 @@ class TestMPS(TestCaseMPS):
         end_event.record()
         with self.assertRaisesRegex(RuntimeError, "must be recorded"):
             start_event.elapsed_time(end_event)
+
+    @parametrize("generic", [False, True])
+    def test_mps_event_elapsed_time_includes_gpu_idle(self, generic):
+        event_type = torch.Event if generic else torch.mps.Event
+        event_kwargs = {"device": "mps"} if generic else {}
+        start_event = event_type(enable_timing=True, **event_kwargs)
+        end_event = event_type(enable_timing=True, **event_kwargs)
+        torch.mps.synchronize()
+        host_start = time.monotonic()
+        start_event.record()
+        start_event.synchronize()
+        time.sleep(0.05)
+        end_event.record()
+        end_event.synchronize()
+        host_ms = (time.monotonic() - host_start) * 1e3
+        elapsed_ms = start_event.elapsed_time(end_event)
+        self.assertGreaterEqual(elapsed_ms, 40.0)
+        self.assertLessEqual(elapsed_ms, host_ms + 20.0)
+
+    @parametrize("generic", [False, True])
+    @parametrize("enable_timing", [False, True])
+    def test_mps_event_query_completes_without_sync(self, generic, enable_timing):
+        event_type = torch.Event if generic else torch.mps.Event
+        event_kwargs = {"device": "mps"} if generic else {}
+        event = event_type(enable_timing=enable_timing, **event_kwargs)
+        event.record()
+        deadline = time.monotonic() + 10
+        while not event.query():
+            self.assertLess(time.monotonic(), deadline, "event never completed")
+            time.sleep(0.001)
+        self.assertTrue(event.query())
 
     def test_generic_event(self):
         startEvent = torch.Event('mps', enable_timing=True)
