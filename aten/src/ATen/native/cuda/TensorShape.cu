@@ -21,8 +21,8 @@ namespace at::native {
 namespace detail {
 
 // NOTE [CUDA fast path for split_with_sizes_copy.out]
-// split_with_sizes_copy.out for contiguous operands has the following
-// properties:
+// split_with_sizes_copy.out for operands that pass has_dense_matching_slices
+// (contiguous ones, for example) has the following properties:
 // - Each src split consists of multiple chunks that are separated by a fixed
 // stride. The number of chunks and the strides are the same across all src
 // splits.
@@ -188,14 +188,14 @@ static inline std::vector<int64_t> get_split_base_addrs(
     at::IntArrayRef split_sizes,
     int64_t dim) {
   const auto* data_ptr = static_cast<const char*>(tensor.const_data_ptr());
-  const auto strides = tensor.strides();
+  const auto slice_numel = c10::multiply_integers(tensor.sizes().slice(dim + 1));
   const auto element_sz = tensor.element_size();
   int64_t off = 0;
   std::vector<int64_t> split_base_addrs;
   split_base_addrs.reserve(split_sizes.size());
   for (const auto& split_size : split_sizes) {
     split_base_addrs.push_back(reinterpret_cast<int64_t>(data_ptr + off));
-    off += split_size * strides[dim] * element_sz;
+    off += split_size * slice_numel * element_sz;
   }
   return split_base_addrs;
 }
@@ -214,12 +214,12 @@ static inline std::vector<int64_t> get_split_chunk_sizes(
     const at::Tensor& tensor,
     at::IntArrayRef split_sizes,
     int64_t dim) {
-  const auto stride = tensor.stride(dim);
+  const auto slice_numel = c10::multiply_integers(tensor.sizes().slice(dim + 1));
   const auto element_sz = tensor.element_size();
   std::vector<int64_t> split_chunk_sizes;
   split_chunk_sizes.reserve(split_sizes.size());
   for (const auto& split_size : split_sizes) {
-    split_chunk_sizes.push_back(split_size * stride * element_sz);
+    split_chunk_sizes.push_back(split_size * slice_numel * element_sz);
   }
   return split_chunk_sizes;
 }
@@ -615,7 +615,8 @@ void _chunk_cat_out_cuda_contiguous(
 
 } // namespace detail
 
-// See [CUDA fast path for split_with_sizes_copy.out]
+// See [CUDA fast path for split_with_sizes_copy.out]. Callers must first check
+// has_dense_matching_slices; other layouts produce wrong values.
 void split_with_sizes_copy_out_cuda_contiguous_no_cast(
     const at::Tensor& self,
     at::IntArrayRef split_sizes,
@@ -705,17 +706,86 @@ void split_with_sizes_copy_out_cuda_contiguous_no_cast(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The fast path copies the i-th memory-order chunk of self (the elements for
+// one index of the dims before dim) to the i-th chunk of each output, one flat
+// byte range per split, ignoring layout inside the range. That is exact when
+// every tensor is dense, the dims from dim on fill one block per chunk, and
+// self and each output order both the chunks and the elements inside them
+// alike. Strides of size-1 dims and empty outputs never matter.
+static bool has_dense_matching_slices(
+    const Tensor& self,
+    TensorList out,
+    int64_t dim) {
+  if (self.is_contiguous() && detail::all_contiguous(out)) {
+    return true;
+  }
+  if (self.numel() == 0) {
+    return true;
+  }
+  if (!self.is_non_overlapping_and_dense()) {
+    return false;
+  }
+  // A single non-empty split laid out exactly like self is a plain copy
+  const auto non_empty = std::count_if(
+      out.begin(), out.end(), [](const Tensor& t) { return t.numel() != 0; });
+  if (non_empty == 1) {
+    const auto& t = *std::find_if(
+        out.begin(), out.end(), [](const Tensor& t) { return t.numel() != 0; });
+    bool same_layout = t.is_non_overlapping_and_dense();
+    for (int64_t d = 0; d < self.dim() && same_layout; ++d) {
+      same_layout = self.size(d) == 1 || t.stride(d) == self.stride(d);
+    }
+    if (same_layout) {
+      return true;
+    }
+  }
+  const int64_t inner = c10::multiply_integers(self.sizes().slice(dim + 1));
+  int64_t inner_extent = 1;
+  for (int64_t d = dim + 1; d < self.dim(); ++d) {
+    inner_extent += (self.size(d) - 1) * self.stride(d);
+  }
+  if (inner_extent != inner ||
+      (self.size(dim) != 1 && self.stride(dim) != inner)) {
+    return false;
+  }
+  // Density then makes every leading stride a multiple of the chunk size
+  const int64_t self_chunk = self.size(dim) * inner;
+  for (const auto& t : out) {
+    if (t.numel() == 0) {
+      continue;
+    }
+    if (!t.is_non_overlapping_and_dense() ||
+        (t.size(dim) != 1 && t.stride(dim) != inner)) {
+      return false;
+    }
+    const int64_t out_chunk = t.size(dim) * inner;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+      if (d == dim || self.size(d) == 1) {
+        continue;
+      }
+      // Leading dims are compared in units of each tensor's own chunk
+      const bool same_order = d < dim
+          ? (t.stride(d) % out_chunk == 0 &&
+             t.stride(d) / out_chunk == self.stride(d) / self_chunk)
+          : t.stride(d) == self.stride(d);
+      if (!same_order) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void split_with_sizes_copy_out_cuda(
     const Tensor& self,
     IntArrayRef split_sizes,
     int64_t dim,
     TensorList out) {
-  bool contiguous_no_cast = self.is_non_overlapping_and_dense();
+  bool dense_no_cast = self.is_non_overlapping_and_dense();
   for (const auto& t : out) {
-    contiguous_no_cast &= t.is_non_overlapping_and_dense();
-    contiguous_no_cast &= (t.dtype() == self.dtype());
+    dense_no_cast &= (t.dtype() == self.dtype());
   }
-  if (contiguous_no_cast) {
+  if (dense_no_cast) {
     // Perform equivalent checks performed by the composite impl
     if (dim < 0) {
       dim = at::maybe_wrap_dim(dim, self.dim());
@@ -771,11 +841,14 @@ void split_with_sizes_copy_out_cuda(
           out[i].device(),
           " instead");
     }
-    split_with_sizes_copy_out_cuda_contiguous_no_cast(
-        self, split_sizes, dim, out);
-  } else {
-    at::native::split_with_sizes_copy_out(self, split_sizes, dim, out);
+    // Checked after resizing, when every output has its final layout
+    if (has_dense_matching_slices(self, out, dim)) {
+      split_with_sizes_copy_out_cuda_contiguous_no_cast(
+          self, split_sizes, dim, out);
+      return;
+    }
   }
+  at::native::split_with_sizes_copy_out(self, split_sizes, dim, out);
 }
 
 Tensor _chunk_cat_cuda(TensorList tensors, int64_t dim, int64_t num_chunks) {
