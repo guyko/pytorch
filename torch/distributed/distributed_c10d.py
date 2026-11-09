@@ -819,11 +819,57 @@ def _create_nccl_process_group(
     return backend_class
 
 
+def _can_split_from_now(pg: ProcessGroup) -> bool:
+    """Whether ``pg``'s backend on its bound device can be split from now.
+
+    A lazy_init nccl2 communicator cannot be split from until its first operation
+    creates it.
+    """
+    device = pg.bound_device_id
+    if device is None:
+        return False
+    try:
+        return pg._get_backend(device).supports_splitting
+    except RuntimeError:
+        return False
+
+
+def _has_uncreated_lazy_nccl2_comm(pg: ProcessGroup) -> bool:
+    """Whether ``pg``'s bound backend is an nccl2 lazy_init communicator not created yet."""
+    device = pg.bound_device_id
+    if device is None or device.type != "cuda" or not is_nccl_available():
+        return False
+    try:
+        backend = pg._get_backend(device)
+    except RuntimeError:
+        return False
+    while is_gloo_available() and isinstance(backend, _ProcessGroupWrapper):
+        backend = backend.wrapped_pg
+    # nccl2 reports supports_splitting=False only for an uncreated lazy communicator.
+    return (
+        isinstance(backend, (ProcessGroupNCCL2, ProcessGroupNCCLLazy))
+        and not backend.supports_splitting
+    )
+
+
 def _nccl2_options(
-    backend_options: object | None,
+    opts: _DistributedBackendOptions, backend_options: object | None
 ) -> "ProcessGroupNCCL.Options":
     if backend_options is None:
-        return ProcessGroupNCCL.Options()
+        pg_options = ProcessGroupNCCL.Options()
+        # Like the legacy backend, create the communicator on first use unless
+        # the caller requested a device, but only for single-rank groups: creating
+        # a multi-rank communicator on first use could hang on a point-to-point op.
+        # Single-rank groups are often placeholders that never communicate (e.g.
+        # vLLM's TP/PP/DP groups at world size 1), and each eager communicator
+        # pins hundreds of MiB of device memory. See #199957. Explicit options are
+        # used as given.
+        pg_options.lazy_init = (
+            opts.group_size == 1
+            and not opts.enable_reconfigure
+            and not opts.device_requested
+        )
+        return pg_options
     if not isinstance(backend_options, ProcessGroupNCCL.Options):
         raise AssertionError(
             "Expected backend_options argument to be of type ProcessGroupNCCL.Options"
@@ -868,7 +914,7 @@ def _create_nccl2_process_group(
 ) -> C10DBackend:
     if not is_nccl_available():
         raise RuntimeError("Distributed package doesn't have NCCL built in")
-    pg_options = _nccl2_options(backend_options)
+    pg_options = _nccl2_options(opts, backend_options)
     # pyrefly: ignore [bad-argument-type]
     pg_options._timeout = opts.timeout
     pg_options.global_ranks_in_group = opts.global_ranks_in_group
@@ -897,7 +943,7 @@ def _create_nccl_lazy_process_group(
 ) -> C10DBackend:
     if not is_nccl_available():
         raise RuntimeError("Distributed package doesn't have NCCL built in")
-    pg_options = _nccl2_options(backend_options)
+    pg_options = _nccl2_options(opts, backend_options)
     # pyrefly: ignore [bad-argument-type]
     pg_options._timeout = opts.timeout
     pg_options.global_ranks_in_group = opts.global_ranks_in_group
@@ -2969,6 +3015,7 @@ def _new_process_group_helper(
     device_id: torch.device | None = None,
     group_desc: str | None = None,
     enable_reconfigure: bool = False,
+    device_requested: bool | None = None,
 ) -> tuple[ProcessGroup | _NonGroupMember, Store | None]:
     """
     Create a new distributed process group.
@@ -3014,7 +3061,9 @@ def _new_process_group_helper(
     # initialization time.  Due to lazy initialization of
     # communicators in some backends, we have to be careful and only
     # split when we *know* the default PG has already started communicator initialization.
-    # We know this if we have bound a device id to the default pg (eager initialized).
+    # We know this if we have bound a device id to the default pg (eager initialized),
+    # except for a lazy_init default pg, which _get_split_source rejects via
+    # supports_splitting until its communicator exists.
     # A lazy_init group is not created by splitting: splitting is eager and collective
     # over the parent.
     if (
@@ -3144,6 +3193,11 @@ def _new_process_group_helper(
                 dist_backend_opts.process_group = pg
                 dist_backend_opts.split_from = split_from
                 dist_backend_opts.enable_reconfigure = enable_reconfigure
+                dist_backend_opts.device_requested = (
+                    device_id is not None
+                    if device_requested is None
+                    else device_requested
+                )
                 backend_result = creator_fn(dist_backend_opts, backend_options)
 
             if backend_result is None:
@@ -7103,7 +7157,8 @@ def split_group(
         not parent_backend or not parent_backend.supports_splitting
     ) and not _use_torchcomms_enabled():
         raise RuntimeError(
-            "No backend for the parent process group or its backend does not support splitting"
+            "No backend for the parent process group or its backend does not support splitting. "
+            "A lazy_init nccl2 group supports splitting only after its first operation."
         )
 
     device_id = parent_pg.bound_device_id
@@ -7390,8 +7445,14 @@ def _new_group_with_tag(
     global _world
 
     default_pg = _get_default_group()
+    device_requested = device_id is not None
     if device_id is None:
         device_id = default_pg.bound_device_id
+        # The device of a default group whose communicator is still lazy is a
+        # fallback, so inheriting it should not make the new group eager.
+        device_requested = device_id is not None and not _has_uncreated_lazy_nccl2_comm(
+            default_pg
+        )
     elif default_pg.bound_device_id is not None:
         if device_id != default_pg.bound_device_id:
             raise AssertionError(
@@ -7502,6 +7563,7 @@ def _new_group_with_tag(
         pg_tag=pg_tag,
         device_id=device_id,
         group_desc=group_desc,
+        device_requested=device_requested,
     )
 
     # Create the global rank to group rank mapping

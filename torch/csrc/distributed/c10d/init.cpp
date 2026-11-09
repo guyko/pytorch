@@ -1678,7 +1678,10 @@ distinct from ``ALLGATHER`` (``all_gather``), but some ops share a value, e.g.
           "split_from", &::c10d::DistributedBackendOptions::split_from)
       .def_readwrite(
           "enable_reconfigure",
-          &::c10d::DistributedBackendOptions::enable_reconfigure);
+          &::c10d::DistributedBackendOptions::enable_reconfigure)
+      .def_readwrite(
+          "device_requested",
+          &::c10d::DistributedBackendOptions::device_requested);
 
   py::class_<
       ::c10d::DMAConnectivity,
@@ -4550,7 +4553,11 @@ Attributes:
             operation instead of when the group is bound to a device, so a
             group that never communicates allocates no NCCL resources. Such a
             group can't be split from until its first operation. Default is
-            False.
+            False. A single-rank group built by ``init_process_group`` or
+            ``new_group`` without options, a ``device_id``, or
+            ``enable_reconfigure`` uses ``lazy_init=True``. ``new_group``
+            counts the default group's device as requested once the default
+            group's communicator exists.
 
 Example::
     >>> import torch.distributed as dist
@@ -4791,8 +4798,9 @@ Returns:
               R"(
             This process group's ``ncclComm_t``, as an opaque handle.
 
-            The process group holds a single communicator, created in its
-            constructor, so the value does not depend on the current device.
+            The process group holds a single communicator, so the value does
+            not depend on the current device. It is 0 while no communicator
+            exists, e.g. before a ``lazy_init`` group's first operation.
 
             .. warning ::
                 The communicator is owned by the process group. Do not modify
